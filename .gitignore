@@ -1,0 +1,13 @@
+# recordings — personal health data, never commit one
+*.vld
+*.log
+
+# ESPHome build output
+.esphome/
+.pioenvs/
+.piolibdeps/
+
+# python
+__pycache__/
+*.pyc
+.venv/
