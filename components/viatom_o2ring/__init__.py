@@ -7,9 +7,22 @@ being worn or charging, storage eviction on wear-start, wrong published .vld
 offsets). No bonding, no encryption, no secret: this is a plain unauthenticated
 GATT peer.
 
-Walks the ring's whole FileList (oldest first) and starts that walk itself,
-on the advertisement absent->present edge -- see viatom_o2ring.h's State enum
-and its parse_device()/maybe_start_sync_() for the state machine.
+Walks the ring's whole FileList (oldest first) once connected -- see
+viatom_o2ring.h's State enum for the state machine. Two ways a sync starts:
+
+- Manual (always available): the `start_sync()` method, typically called
+  from an HA button -- see start_sync() in the .cpp.
+- Automatic (`auto_sync: true`, off by default): the component's own
+  advertisement listener connects ONCE when the ring appears after being off
+  air continuously for `off_air_threshold` (default 2h), syncs, disconnects,
+  then stays silent however long the ring keeps advertising -- see
+  parse_device()/maybe_start_auto_sync_() in the .cpp. Every connect costs
+  the ring's own battery, which is why the default is manual only.
+
+Either way, a failed connect is retried by maybe_retry_connect_() (raw BLE
+flakiness, several attempts within one sync), and automatic sync also
+retries the whole sync once before giving up until the ring's next
+appearance (on_sync_campaign_done_()).
 """
 
 import esphome.codegen as cg
@@ -29,13 +42,16 @@ DEPENDENCIES = ["ble_client"]
 # json::parse_json() (used to decode the INFO reply) needs USE_JSON defined
 # and ArduinoJson pulled in, which only happens if the json component's own
 # to_code() runs -- nothing else on this board configures a `json:` block to
-# trigger that, so it has to be auto-loaded here.
-AUTO_LOAD = ["json"]
+# trigger that, so it has to be auto-loaded here. sensor and text_sensor
+# likewise: this component's own entities need their headers built even on a
+# board that configures no other sensor.
+AUTO_LOAD = ["json", "sensor", "text_sensor"]
 
 CONF_SERIAL_NUMBER = "serial_number"
 CONF_FILE_LIST = "file_list"
 CONF_LAST_SYNC = "last_sync"
-CONF_MIN_SYNC_INTERVAL = "min_sync_interval"
+CONF_AUTO_SYNC = "auto_sync"
+CONF_OFF_AIR_THRESHOLD = "off_air_threshold"
 
 viatom_o2ring_ns = cg.esphome_ns.namespace("viatom_o2ring")
 ViatomO2Ring = viatom_o2ring_ns.class_(
@@ -78,17 +94,23 @@ CONFIG_SCHEMA = (
                 icon="mdi:clock-check-outline",
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
-            # Floor between sync attempts. Exists to stop a long continuous
-            # advertising period (e.g. a full charge) from reconnecting
-            # repeatedly -- it is not what schedules a sync; the
-            # advertisement edge in parse_device() does that.
+            # Off by default: manual start_sync() only, so the component never
+            # connects to the ring on its own.
+            cv.Optional(CONF_AUTO_SYNC, default=False): cv.boolean,
             cv.Optional(
-                CONF_MIN_SYNC_INTERVAL, default="30min"
-            ): cv.positive_time_period_milliseconds,
+                CONF_OFF_AIR_THRESHOLD, default="2h"
+            ): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(minutes=1), max=cv.TimePeriod(hours=24)),
+            ),
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
     .extend(ble_client.BLE_CLIENT_SCHEMA)
+    # Also a BLE_DEVICE, not just a BLE client: automatic sync listens for
+    # the ring's advertisement (to detect the off-air -> on-air edge) as well
+    # as talking GATT to it once connected. register_ble_device() needs
+    # ble_hub_id from this schema.
     .extend(ble_device_base.BLE_DEVICE_SCHEMA)
 )
 
@@ -97,10 +119,10 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await ble_client.register_ble_node(var, config)
-    # Registers this as a parsed-advertisement listener on the tracker --
-    # independent of the ble_client connection, so the edge in
-    # parse_device() fires whether or not a link is currently open.
+    # Advertisement listener as well as GATT client -- see the docstring above.
     await ble_device_base.register_ble_device(var, config)
+    cg.add(var.set_auto_sync(config[CONF_AUTO_SYNC]))
+    cg.add(var.set_off_air_threshold(config[CONF_OFF_AIR_THRESHOLD]))
 
     if battery_config := config.get(CONF_BATTERY_LEVEL):
         sens = await sensor.new_sensor(battery_config)
@@ -117,4 +139,3 @@ async def to_code(config):
     if last_sync_config := config.get(CONF_LAST_SYNC):
         ts = await text_sensor.new_text_sensor(last_sync_config)
         cg.add(var.set_last_sync_text_sensor(ts))
-    cg.add(var.set_min_sync_interval(config[CONF_MIN_SYNC_INTERVAL].total_milliseconds))

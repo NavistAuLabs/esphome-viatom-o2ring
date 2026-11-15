@@ -10,6 +10,38 @@ needed to run it.
 Recordings land at `/sdcard/o2ring/<serial>/<name>.vld`, promoted from
 `.partial/` only once complete.
 
+## When it syncs
+
+**Manual by default.** With `auto_sync: false` (the default) the component
+never connects on its own: a sync runs only when something calls
+`start_sync()`, an HA button for example. Every connect costs the ring's own
+battery, which the whole capture depends on, so this is the recommended
+setting.
+
+**`auto_sync: true` adds one automatic connect per appearance.** The
+component then listens for the ring's advertisement and connects **once**
+when the ring appears after being off air continuously for
+`off_air_threshold` (default 2h). It syncs whatever is in FileList and not
+already on the card, disconnects, and stays silent however long that
+appearance lasts; only another full `off_air_threshold` off air re-arms it.
+If that attempt fails it is retried once while the ring is still present,
+then it gives up until the next appearance. The first sighting after boot
+counts as an appearance. `parse_device()`/`maybe_start_auto_sync_()`/
+`on_sync_campaign_done_()` in the .cpp.
+
+`start_sync()` works either way and is independent of the automatic arm
+state: it never consumes or resets the re-arm timer. Every sync reads INFO
+and downloads everything in FileList not already on the card; raw connect
+failures are retried automatically (`ble_client.connect` fails roughly half
+the time, see the gotcha below), up to 4 attempts per sync, and a link
+dropped mid-walk is reported and cleared rather than left looking like a
+sync that is still running.
+
+The ring must be reachable (worn or charging) for a sync to succeed.
+Charging state is only visible from inside a connection, so a short dock
+can be missed. The recording stays on the ring and is picked up by the next
+successful sync (the ring keeps four sessions).
+
 ## Protocol
 
 No bonding, no encryption, no secret — the ring is open.
@@ -112,9 +144,14 @@ indistinguishable from a listener that is never called.
 component's own advertisement log, "is the listener even being called?"
 is unanswerable from outside the device. Keep it.
 
-**Never return silently from a guard.** An edge is a one-shot; a
-swallowed one is invisible until the ring next goes fully off the air.
-`maybe_start_sync_()` says why it skipped.
+**An advertisement listener that reconnects more than once per appearance is
+a poll, even if it looks edge-triggered.** A plain edge trigger fires once
+at bedtime, before the session is in FileList, and never again until the
+ring sleeps; a level-based cadence (reconnect every N minutes while the ring
+advertises) reconnects all night while it is worn. Both drain the ring's
+battery. Automatic sync instead disarms after its one attempt and re-arms
+only after a continuous off-air period, so a ring worn all night never gets
+a second connect.
 
 **`ble_client.connect` fails roughly half the time** with
 `ESP_GATTC_DISCONNECT_EVT reason 0x100` then `OPEN_EVT status=133`, after

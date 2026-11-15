@@ -43,12 +43,6 @@ static const uint32_t REPLY_TIMEOUT_MS = 10000;
 // known file-size limit.
 static const uint16_t MAX_FILE_READ_BLOCKS = 8000;
 
-// The sync trigger is seeing the device advertise after a timeout. The
-// timeout must be at least 20s: that is how long a connection attempt takes,
-// and the scanner hears no advertisements during one -- anything shorter
-// fires the trigger after every failed attempt.
-static const uint32_t PRESENCE_TIMEOUT_MS = 60000;
-
 // ble_client.connect fails roughly half the time with ESP_GATTC_DISCONNECT_EVT
 // reason 0x100 (cancelled locally, not refused by the ring) -- cause unknown,
 // and not bluetooth_proxy slot contention or scan duty cycle: changing either
@@ -57,6 +51,19 @@ static const uint32_t PRESENCE_TIMEOUT_MS = 60000;
 // even odds, well inside the minutes-long window a charging ring stays awake.
 static const uint8_t MAX_CONNECT_RETRIES = 4;
 static const uint32_t CONNECT_RETRY_DELAY_MS = 3000;
+
+// Automatic sync: the ring goes fully silent (not merely unconnectable) once
+// asleep and advertises steadily the whole time it is awake, so 60s with no
+// advertisement means it is off air rather than between two adverts. The
+// timeout must exceed the BLE connect timeout (20s): the scanner hears no
+// advertisements while a connect is in flight, so anything shorter makes
+// presence expire during every failed attempt and the next advertisement look
+// like a fresh appearance.
+static const uint32_t PRESENCE_TIMEOUT_MS = 60000;
+// Delay before automatic sync's one whole-sync retry. Distinct from
+// CONNECT_RETRY_DELAY_MS, which retries a single raw connect several times
+// within one attempt.
+static const uint32_t AUTO_SYNC_RETRY_DELAY_MS = 3000;
 
 // Fixed mount point of the sd_mmc_card component (not configurable there),
 // and so the root path anything serving the card has to be pointed at.
@@ -208,6 +215,11 @@ ViatomPacket ViatomPacketCodec::take_packet() {
 void ViatomO2Ring::dump_config() {
   ESP_LOGCONFIG(TAG, "Viatom O2Ring:");
   ESP_LOGCONFIG(TAG, "  MAC Address: %s", this->parent()->address_str());
+  if (this->auto_sync_) {
+    ESP_LOGCONFIG(TAG, "  Auto sync: on, after %us off air", (unsigned) (this->off_air_threshold_ms_ / 1000));
+  } else {
+    ESP_LOGCONFIG(TAG, "  Auto sync: off (start_sync() only)");
+  }
 }
 
 void ViatomO2Ring::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
@@ -224,6 +236,17 @@ void ViatomO2Ring::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       // case .partial/ exists for: this closes the handle and drops the
       // in-flight fields, but never touches the bytes already written.
       this->reset_download_state_();
+      // finish_() clears syncing_ before its own disconnect lands, so a
+      // campaign still marked in progress past service discovery means the
+      // link dropped mid-walk. End it, or a later start_sync() call would
+      // treat one as still running and refuse to start -- and feed automatic
+      // sync's retry-or-give-up decision (no-op for a manual run): a dropped
+      // link is a failed sync exactly as much as a bad reply is.
+      if (this->syncing_ && this->reached_search_cmpl_) {
+        ESP_LOGW(TAG, "[%s] Link dropped mid-sync", this->parent()->address_str());
+        this->syncing_ = false;
+        this->on_sync_campaign_done_(false);
+      }
       // A raw connect failure can already show IDLE here (see
       // maybe_retry_connect_()'s comment for why more than one event needs
       // this same check).
@@ -293,7 +316,7 @@ void ViatomO2Ring::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
             this->handle_info_reply_(pkt.data);
           } else {
             ESP_LOGW(TAG, "[%s] INFO reply status 0x%02x", this->parent()->address_str(), pkt.status);
-            this->finish_();
+            this->finish_(false);
           }
           break;
         case State::AWAITING_OPEN:
@@ -354,7 +377,7 @@ void ViatomO2Ring::handle_info_reply_(const std::vector<uint8_t> &payload) {
   if (start == std::string::npos || end == std::string::npos || end < start) {
     ESP_LOGW(TAG, "[%s] INFO reply had no JSON payload (%u bytes)", this->parent()->address_str(),
              (unsigned) payload.size());
-    this->finish_();
+    this->finish_(false);
     return;
   }
   const std::string json_text = text.substr(start, end - start + 1);
@@ -398,7 +421,7 @@ void ViatomO2Ring::handle_info_reply_(const std::vector<uint8_t> &payload) {
 
   if (!ok) {
     ESP_LOGW(TAG, "[%s] INFO JSON failed to parse: %s", this->parent()->address_str(), json_text.c_str());
-    this->finish_();
+    this->finish_(false);
   }
 }
 
@@ -437,7 +460,8 @@ void ViatomO2Ring::build_pending_downloads_(const std::string &sn, const std::st
 
 void ViatomO2Ring::start_next_download_() {
   if (this->pending_files_.empty()) {
-    if (this->walk_had_failure_) {
+    const bool success = !this->walk_had_failure_;
+    if (!success) {
       ESP_LOGW(TAG, "[%s] FileList walk finished with at least one failed transfer -- last-sync not advanced",
                this->parent()->address_str());
     } else {
@@ -445,7 +469,7 @@ void ViatomO2Ring::start_next_download_() {
       if (this->last_sync_text_sensor_ != nullptr)
         this->last_sync_text_sensor_->publish_state(this->cur_time_);
     }
-    this->finish_();
+    this->finish_(success);
     return;
   }
 
@@ -602,65 +626,21 @@ void ViatomO2Ring::reset_download_state_() {
   this->download_failed_ = false;
 }
 
-bool ViatomO2Ring::parse_device(const ble_device_base::ESPBTDevice &device) {
-  if (device.address_uint64() != this->parent()->get_address())
-    return false;
-
-  // VERBOSE, not VERY_VERBOSE: the device logger runs at VERBOSE, and a
-  // VERY_VERBOSE statement is compiled out entirely at that level, which reads
-  // as "no advertisements" and is indistinguishable from the listener never
-  // being called. The tracker logs nothing per-advertisement of its own, so
-  // this is the only way to answer "is this listener even reached?" from
-  // outside.
-  ESP_LOGV(TAG, "[%s] advertisement seen (present=%d)", this->parent()->address_str(), (int) this->ring_present_);
-
-  const bool was_present = this->ring_present_;
-  this->ring_present_ = true;
-  // Rescheduled on every advertisement seen; PRESENCE_TIMEOUT_MS after the
-  // last one, this flips back to false and the next sighting is an edge
-  // again -- this is the "gone quiet" detector, entirely separate from the
-  // sync rate limit in maybe_start_sync_().
-  this->cancel_timeout("presence");
-  this->set_timeout("presence", PRESENCE_TIMEOUT_MS, [this]() { this->ring_present_ = false; });
-
-  if (!was_present) {
-    // Absent -> present: the ring was fully silent and just started
-    // advertising, which after a night's wear means it's being docked (see
-    // the capture-window sequence in this component's README). This is the trigger;
-    // maybe_start_sync_() applies the actual rate limit.
-    ESP_LOGD(TAG, "[%s] Started advertising -- likely just woke", this->parent()->address_str());
-    this->maybe_start_sync_(millis());
+void ViatomO2Ring::start_sync() {
+  // The manual entry point (an HA button, say). Leaves auto_active_ false, so
+  // on_sync_campaign_done_() ignores the run, and never touches armed_ or the
+  // re-arm timer: a manual sync works whatever automatic sync's state.
+  if (this->syncing_) {
+    ESP_LOGW(TAG, "[%s] Sync requested but one is already running", this->parent()->address_str());
+    return;
   }
-  return true;
-}
-
-void ViatomO2Ring::maybe_start_sync_(uint32_t now) {
   if (this->parent()->state() != espbt::ClientState::IDLE) {
-    // A connection -- ours from an earlier retry, or the manual button's --
-    // is already in flight. Let it run rather than stepping on it.
-    //
-    // Logged rather than returning silently: a client left stuck in a
-    // non-IDLE state after a timed-out connect swallows every subsequent
-    // edge, and an edge is a ONE-SHOT -- the ring advertises continuously
-    // once awake, so a swallowed edge is not retried until it next goes
-    // fully off the air. Silence here is indistinguishable from the listener
-    // never firing.
-    ESP_LOGD(TAG, "[%s] Edge ignored: client state %d, not IDLE", this->parent()->address_str(),
+    ESP_LOGW(TAG, "[%s] Sync requested but client state is %d, not IDLE", this->parent()->address_str(),
              (int) this->parent()->state());
     return;
   }
-  if (this->has_synced_before_ && now - this->last_sync_attempt_ms_ < this->min_sync_interval_ms_) {
-    // The rate limit exists to stop a long continuous advertising period
-    // (e.g. a full charge cycle) from reconnecting repeatedly, not to
-    // schedule discovery -- the edge above is what decides *when* to try.
-    ESP_LOGD(TAG, "[%s] Skipping sync, last attempt %u ms ago (minimum %u ms)", this->parent()->address_str(),
-             (unsigned) (now - this->last_sync_attempt_ms_), (unsigned) this->min_sync_interval_ms_);
-    return;
-  }
 
-  ESP_LOGI(TAG, "[%s] Starting sync", this->parent()->address_str());
-  this->has_synced_before_ = true;
-  this->last_sync_attempt_ms_ = now;
+  ESP_LOGI(TAG, "[%s] Starting sync (manual)", this->parent()->address_str());
   this->syncing_ = true;
   this->connect_attempts_ = 0;
   this->reached_search_cmpl_ = false;
@@ -668,24 +648,128 @@ void ViatomO2Ring::maybe_start_sync_(uint32_t now) {
   this->parent()->connect();
 }
 
+bool ViatomO2Ring::parse_device(const ble_device_base::ESPBTDevice &device) {
+  if (device.address_uint64() != this->parent()->get_address())
+    return false;
+  // Manual-only: the advertisement is ours, but nothing here may connect.
+  if (!this->auto_sync_)
+    return true;
+
+  const bool was_present = this->ring_present_;
+  this->ring_present_ = true;
+  // Rescheduled on every advertisement seen; PRESENCE_TIMEOUT_MS after the
+  // last one the ring counts as off air -- see on_off_air_(). Reappearing also
+  // cancels a pending re-arm, so the off-air time has to be continuous.
+  this->cancel_timeout("presence");
+  this->cancel_timeout("rearm");
+  this->set_timeout("presence", PRESENCE_TIMEOUT_MS, [this]() { this->on_off_air_(); });
+
+  if (!was_present) {
+    ESP_LOGD(TAG, "[%s] Started advertising, rssi=%d", this->parent()->address_str(), device.get_rssi());
+    this->maybe_start_auto_sync_();
+  } else {
+    // VERBOSE, not VERY_VERBOSE: the device logger runs at VERBOSE, and a
+    // VERY_VERBOSE statement is compiled out entirely at that level, which reads
+    // as "no advertisements" and is indistinguishable from the listener never
+    // being called. The tracker logs nothing per-advertisement of its own, so
+    // this is the only way to answer "is this listener even reached?" from
+    // outside.
+    ESP_LOGV(TAG, "[%s] advertisement seen (present=1)", this->parent()->address_str());
+  }
+  return true;
+}
+
+void ViatomO2Ring::on_off_air_() {
+  this->ring_present_ = false;
+  ESP_LOGD(TAG, "[%s] Off air -- re-arming in %us", this->parent()->address_str(),
+           (unsigned) (this->off_air_threshold_ms_ / 1000));
+  this->set_timeout("rearm", this->off_air_threshold_ms_, [this]() {
+    this->armed_ = true;
+    ESP_LOGD(TAG, "[%s] Re-armed after %us off air", this->parent()->address_str(),
+             (unsigned) (this->off_air_threshold_ms_ / 1000));
+  });
+}
+
+void ViatomO2Ring::maybe_start_auto_sync_() {
+  if (!this->armed_) {
+    ESP_LOGD(TAG, "[%s] Auto sync skipped: not off air long enough since the last one",
+             this->parent()->address_str());
+    return;
+  }
+  if (this->syncing_ || this->parent()->state() != espbt::ClientState::IDLE) {
+    // Rare race with a manual start_sync() already in flight. Not retried:
+    // the edge is lost, but the ring stays armed, so the next appearance
+    // still syncs.
+    ESP_LOGD(TAG, "[%s] Auto sync deferred: a connection is already in flight", this->parent()->address_str());
+    return;
+  }
+
+  // Disarm before the outcome is known: no further connects while the ring
+  // stays on air, whether this attempt (or its one retry) succeeds or not.
+  this->armed_ = false;
+  this->auto_attempt_ = 1;
+  this->start_auto_sync_campaign_();
+}
+
+void ViatomO2Ring::start_auto_sync_campaign_() {
+  if (this->parent()->state() != espbt::ClientState::IDLE) {
+    ESP_LOGW(TAG, "[%s] Auto sync retry skipped: client busy -- giving up until next appearance",
+             this->parent()->address_str());
+    this->auto_active_ = false;
+    return;
+  }
+  ESP_LOGI(TAG, "[%s] Starting sync (auto, attempt %u/2)", this->parent()->address_str(),
+           (unsigned) this->auto_attempt_);
+  this->auto_active_ = true;
+  this->syncing_ = true;
+  this->connect_attempts_ = 0;
+  this->reached_search_cmpl_ = false;
+  this->cancel_timeout("connect_retry");
+  this->parent()->connect();
+}
+
+void ViatomO2Ring::on_sync_campaign_done_(bool success) {
+  if (!this->auto_active_)
+    return;  // a manual start_sync() run -- nothing more to do
+  this->auto_active_ = false;
+
+  if (success) {
+    ESP_LOGD(TAG, "[%s] Auto sync succeeded on attempt %u -- disarmed until re-armed",
+             this->parent()->address_str(), (unsigned) this->auto_attempt_);
+    return;
+  }
+  if (this->auto_attempt_ < 2 && this->ring_present_) {
+    ESP_LOGW(TAG, "[%s] Auto sync attempt %u failed -- retrying once", this->parent()->address_str(),
+             (unsigned) this->auto_attempt_);
+    this->auto_attempt_ = 2;
+    this->set_timeout("auto_retry", AUTO_SYNC_RETRY_DELAY_MS, [this]() { this->start_auto_sync_campaign_(); });
+  } else {
+    ESP_LOGW(TAG, "[%s] Auto sync failed after %u attempt(s) -- giving up until next appearance",
+             this->parent()->address_str(), (unsigned) this->auto_attempt_);
+  }
+}
+
 void ViatomO2Ring::maybe_retry_connect_() {
-  // Only a sync this component started, and only while the connection
-  // hasn't gotten anywhere yet -- a manual `O2Ring Connect` press, or a
-  // disconnect after real protocol progress, are left to run their course
-  // rather than retried here. Both DISCONNECT_EVT and OPEN_EVT/CLOSE_EVT can
-  // be the event where the parent's state actually lands back on IDLE for a
-  // cancelled connect (ESP_GATTC_DISCONNECT_EVT reason 0x100 followed by
-  // OPEN_EVT status=133) -- retry_pending_
-  // stops more than one of them from double-scheduling the same retry.
+  // Only a sync this component started, and only while the connection hasn't
+  // gotten anywhere yet -- a disconnect after real protocol progress is left
+  // to run its course rather than retried here. Both DISCONNECT_EVT and
+  // OPEN_EVT/CLOSE_EVT can be the event where the parent's state actually
+  // lands back on IDLE for a cancelled connect (ESP_GATTC_DISCONNECT_EVT
+  // reason 0x100 followed by OPEN_EVT status=133) -- retry_pending_ stops more
+  // than one of them from double-scheduling the same retry.
   if (!this->syncing_ || this->reached_search_cmpl_ || this->retry_pending_)
     return;
   if (this->parent()->state() != espbt::ClientState::IDLE)
     return;
 
   if (this->connect_attempts_ >= MAX_CONNECT_RETRIES) {
-    ESP_LOGW(TAG, "[%s] Giving up after %u failed connect attempts", this->parent()->address_str(),
-             (unsigned) this->connect_attempts_);
+    ESP_LOGW(TAG, "[%s] Giving up after %u failed connect attempts (this sync attempt)",
+             this->parent()->address_str(), (unsigned) this->connect_attempts_);
     this->syncing_ = false;
+    // Never reached service discovery, so finish_() (which also disconnects)
+    // has no link to release -- go straight to automatic sync's
+    // retry-or-give-up decision. No-op for a manual start_sync() run (auto_active_ false).
+    this->on_sync_campaign_done_(false);
     return;
   }
 
@@ -700,7 +784,7 @@ void ViatomO2Ring::maybe_retry_connect_() {
   });
 }
 
-void ViatomO2Ring::finish_() {
+void ViatomO2Ring::finish_(bool success) {
   this->state_ = State::DONE;
   this->syncing_ = false;
   // RELEASE THE LINK. A connected BLE peripheral stops advertising, so holding
@@ -710,9 +794,13 @@ void ViatomO2Ring::finish_() {
   // ring's countdown / "saving" / "END" display sequence, so keeping it open
   // risks the recording never being written at all.
   if (this->parent() != nullptr) {
-    ESP_LOGD(TAG, "[%s] Sync finished, disconnecting", this->parent()->address_str());
+    ESP_LOGI(TAG, "[%s] Sync finished (%s), disconnecting", this->parent()->address_str(),
+             success ? "ok" : "failed");
     this->parent()->disconnect();
   }
+  // No-op for a manual start_sync() run (auto_active_ false) -- see its
+  // comment.
+  this->on_sync_campaign_done_(success);
 }
 
 }  // namespace viatom_o2ring

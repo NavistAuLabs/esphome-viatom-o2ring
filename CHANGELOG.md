@@ -12,6 +12,34 @@ recording the ring has already rotated away.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+### Breaking
+
+- `min_sync_interval` is removed, and so is the trigger it limited (a sync on
+  every reappearance of the ring after 60 s off air). A configuration that
+  still sets it fails validation: delete the line. By default the component
+  now never connects on its own; see `start_sync()` and `auto_sync` below.
+
+### Added
+
+- `start_sync()`: starts a sync on demand, for example from a template button
+  or an automation. Ignored while a sync is already running or the BLE
+  client is busy.
+- `auto_sync` (default `false`) and `off_air_threshold` (default `2h`):
+  opt-in automatic sync that connects once when the ring appears after being
+  off air continuously for `off_air_threshold`, retries once on failure, and
+  then stays silent until the ring has been off air that long again. Every
+  connect costs the ring's battery, so off is the recommended setting.
+
+### Fixed
+
+- A link that drops mid-walk now ends the sync, instead of leaving the
+  component believing a sync is still running and refusing every later one.
+- The build no longer fails with `sensor/sensor.h: No such file or
+  directory` on a board that configures no other sensor: the component now
+  auto-loads `sensor` and `text_sensor`.
+
 ## [0.1.0] - 2026-09-18
 
 First public release.
@@ -45,5 +73,6 @@ First public release.
   corrected `.vld` layout, and the measured device behaviour — with verified
   fields separated from unverified inherited labels.
 
-[Unreleased]: https://github.com/NavistAuLabs/esphome-viatom-o2ring/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/NavistAuLabs/esphome-viatom-o2ring/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/NavistAuLabs/esphome-viatom-o2ring/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/NavistAuLabs/esphome-viatom-o2ring/releases/tag/v0.1.0

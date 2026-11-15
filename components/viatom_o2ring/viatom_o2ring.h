@@ -102,22 +102,33 @@ class ViatomO2Ring : public Component,
   void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                             esp_ble_gattc_cb_param_t *param) override;
 
-  /// Advertisement-parsed path (registered directly with the tracker, not via
-  /// the ble_client parent) -- this is how an absent->present edge is
-  /// noticed even though the ring is otherwise not connected. See
-  /// parse_device()'s comment in the .cpp for the edge/rate-limit split.
+  /// Automatic sync (auto_sync_ only; a no-op otherwise): connect ONCE when
+  /// the ring appears after being off air for off_air_threshold_ms_, sync
+  /// FileList, disconnect, then stay silent however long it keeps
+  /// advertising -- see maybe_start_auto_sync_() and on_off_air_() in the .cpp.
   bool parse_device(const ble_device_base::ESPBTDevice &device) override;
+
+  /// The manual trigger (an HA button, say). Independent of automatic
+  /// sync's arm state -- always allowed, never consumes or resets the re-arm
+  /// timer. No-ops if a sync is already running or the client isn't IDLE;
+  /// retried automatically on connect failure (maybe_retry_connect_()) once
+  /// started.
+  void start_sync();
+
+  void set_auto_sync(bool auto_sync) { this->auto_sync_ = auto_sync; }
+  void set_off_air_threshold(uint32_t ms) { this->off_air_threshold_ms_ = ms; }
 
   void set_battery_level_sensor(sensor::Sensor *s) { this->battery_level_sensor_ = s; }
   void set_serial_number_text_sensor(text_sensor::TextSensor *s) { this->serial_number_text_sensor_ = s; }
   void set_state_text_sensor(text_sensor::TextSensor *s) { this->state_text_sensor_ = s; }
   void set_file_list_text_sensor(text_sensor::TextSensor *s) { this->file_list_text_sensor_ = s; }
   void set_last_sync_text_sensor(text_sensor::TextSensor *s) { this->last_sync_text_sensor_ = s; }
-  void set_min_sync_interval(uint32_t ms) { this->min_sync_interval_ms_ = ms; }
 
  protected:
-  /// Enter DONE and release the BLE link. Never just set the state.
-  void finish_();
+  /// Enter DONE and release the BLE link. Never just set the state. `success`
+  /// feeds automatic sync's retry-once-then-give-up decision
+  /// (on_sync_campaign_done_()) -- ignored for a manual run.
+  void finish_(bool success);
   void send_request_(uint8_t cmd, uint16_t block = 0, const std::vector<uint8_t> &data = {});
   void write_next_fragment_();
   void handle_info_reply_(const std::vector<uint8_t> &payload);
@@ -136,13 +147,32 @@ class ViatomO2Ring : public Component,
   /// it landed, per the staging/promotion contract in the .cpp.
   void reset_download_state_();
 
-  /// Called from maybe_start_sync_() and from every gattc event that could
-  /// mark a raw connect failure (see .cpp for why more than one event can).
-  /// No-op unless a sync campaign (syncing_) is in progress and hasn't yet
-  /// reached service discovery.
+  /// Called from start_sync()/start_auto_sync_campaign_() and from every gattc
+  /// event that could mark a raw connect failure (see .cpp for why more than
+  /// one event can). No-op unless a sync campaign (syncing_) is in progress
+  /// and hasn't yet reached service discovery.
   void maybe_retry_connect_();
-  /// Absent->present edge handler: rate-limits, then starts a connect.
-  void maybe_start_sync_(uint32_t now);
+
+  /// Fires PRESENCE_TIMEOUT_MS after the last advertisement -- the ring has
+  /// gone truly off air (asleep), not just a gap between adverts. Starts the
+  /// off_air_threshold_ms_ countdown to re-arm; cancelled if the ring reappears
+  /// before that countdown finishes, so a re-appearance inside the window
+  /// never arms early.
+  void on_off_air_();
+  /// Called from parse_device() on the off-air -> on-air edge. No-ops (and
+  /// logs why) unless armed_ and the client is IDLE; otherwise disarms and
+  /// starts the first automatic attempt.
+  void maybe_start_auto_sync_();
+  /// Connects for the current automatic attempt (1st or the one retry) --
+  /// shared by maybe_start_auto_sync_() and the retry scheduled from
+  /// on_sync_campaign_done_().
+  void start_auto_sync_campaign_();
+  /// Automatic sync's retry-once-then-give-up policy, called from every
+  /// terminal path of an automatic campaign (finish_() and maybe_retry_connect_()'s give-up
+  /// branch). No-op for a manual (start_sync()) run. Success or exhausted
+  /// failure both leave the ring disarmed until the next re-arm; only a
+  /// first-attempt failure, with the ring still present, gets the one retry.
+  void on_sync_campaign_done_(bool success);
 
   ViatomPacketCodec codec_;
   State state_{State::IDLE};
@@ -174,17 +204,34 @@ class ViatomO2Ring : public Component,
   std::string cur_time_;
   bool walk_had_failure_{false};
 
-  // Advertisement presence edge (parse_device()) and the sync campaign it
-  // starts (maybe_start_sync_() / maybe_retry_connect_()) -- see the .cpp
-  // for the full state machine these drive.
-  bool ring_present_{false};
-  bool has_synced_before_{false};
-  uint32_t last_sync_attempt_ms_{0};
-  uint32_t min_sync_interval_ms_{30 * 60 * 1000};
+  // The sync campaign started by start_sync() / start_auto_sync_campaign_() /
+  // retried by maybe_retry_connect_() -- see the .cpp for the full state
+  // machine these drive.
   bool syncing_{false};
   bool reached_search_cmpl_{false};
   bool retry_pending_{false};
   uint8_t connect_attempts_{0};
+
+  // Automatic sync: config, advertisement presence, the arm/disarm state and
+  // the one whole-sync retry -- see parse_device()/maybe_start_auto_sync_()/
+  // on_sync_campaign_done_() in the .cpp. Independent of the low-level
+  // connect_attempts_/retry_pending_ above, which handle raw BLE connect
+  // flakiness underneath a single automatic attempt.
+  bool auto_sync_{false};
+  uint32_t off_air_threshold_ms_{2 * 60 * 60 * 1000};
+  bool ring_present_{false};
+  // Starts true: the first sighting after boot is treated as an appearance
+  // after being off air, so it is not stranded waiting for a re-arm that can
+  // never happen (the ring was never "on" to go off from).
+  bool armed_{true};
+  // Set only while an automatic campaign owns the current connection;
+  // false for a manual start_sync() run, so on_sync_campaign_done_() and the
+  // give-up path in maybe_retry_connect_() leave a manual sync alone.
+  bool auto_active_{false};
+  // 1 = first automatic attempt this appearance, 2 = the one retry. Purely for
+  // logging/bookkeeping -- the retry-or-give-up decision itself lives in
+  // on_sync_campaign_done_().
+  uint8_t auto_attempt_{0};
 
   sensor::Sensor *battery_level_sensor_{nullptr};
   text_sensor::TextSensor *serial_number_text_sensor_{nullptr};

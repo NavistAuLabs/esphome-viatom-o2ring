@@ -43,11 +43,17 @@ dock it (discharged)  awake for the whole charge -> this is the window
 fully charged         sleeps, off the air entirely
 ```
 
-So the component does not poll on a timer. It watches for the ring's
-advertisements going from absent to present — which, after a night's wear,
-means it was just docked — and starts a sync on that edge.
-`min_sync_interval` is only a floor between attempts so that one long charge
-does not cause repeated reconnects; it is not a schedule.
+Every connect also costs the ring's own battery, which the whole capture
+depends on. So by default the component never connects on its own: a sync
+runs only when something calls `start_sync()`, such as an HA button you
+press after docking the ring, or an automation on a charger smart plug.
+
+If you would rather not press anything, `auto_sync: true` adds exactly one
+automatic connect per appearance: when the ring shows up after being off air
+continuously for `off_air_threshold` (default 2h), the component syncs once,
+retries once if that fails, and then stays silent however long the ring
+keeps advertising. It never reconnects on a timer. Manual only (the default)
+is the recommended setting.
 
 ## Installation
 
@@ -56,7 +62,7 @@ does not cause repeated reconnects; it is not a schedule.
 - **A board within BLE range of wherever the ring charges.** Developed and
   verified on the **ESP-IDF** framework.
 - **`esp32_ble_tracker`** — the component registers as an advertisement
-  listener, which is how it notices the ring waking up.
+  listener, which is how `auto_sync` notices the ring appearing.
 - **`ble_client`** for the ring, with **`auto_connect: false`**. The component
   opens and closes the link itself, and that matters: a connected BLE
   peripheral stops advertising, so a link held open makes the ring invisible
@@ -76,7 +82,7 @@ service UUIDs, so the MAC is the only way to identify it.
 
 ```yaml
 external_components:
-  - source: github://NavistAuLabs/esphome-viatom-o2ring@v0.1.0
+  - source: github://NavistAuLabs/esphome-viatom-o2ring@v0.2.0
     components: [viatom_o2ring]
   # SD card mount. Pinned at the commit upstream's v0.2.0 tag points at: a
   # branch moves, and a tag can be repointed.
@@ -119,30 +125,41 @@ ble_client:
     auto_connect: false                # the component drives the connection
 
 viatom_o2ring:
+  id: o2ring_sync
   ble_client_id: o2ring
-  min_sync_interval: 30min
+  # auto_sync: true          # opt in to one connect per appearance (see above)
+  # off_air_threshold: 2h
   battery_level:  { name: "O2Ring Battery" }
   serial_number:  { name: "O2Ring Serial" }
   state:          { name: "O2Ring State" }
   file_list:      { name: "O2Ring File List" }
   last_sync:      { name: "O2Ring Last Sync" }
+
+button:
+  - platform: template
+    name: "O2Ring Sync"
+    on_press:
+      - lambda: id(o2ring_sync).start_sync();
 ```
 
 ### 3. Confirm a sync
 
-Wear the ring overnight, take it off, and dock it discharged. Set
-`logger: level: VERBOSE` for the first run: the component logs every
-advertisement it sees at that level, which is how you tell "the listener is
-not being called" apart from "the ring is asleep". A completed walk logs
+Wear the ring overnight, take it off, dock it discharged, and press
+**O2Ring Sync** (with `auto_sync: true`, the sync starts by itself once the
+ring has been off air for `off_air_threshold`). A completed walk logs
 `FileList walk finished clean` and leaves files under
-`/sdcard/o2ring/<serial>/`.
+`/sdcard/o2ring/<serial>/`. With `auto_sync`, set `logger: level: VERBOSE`
+for the first run: the component logs every advertisement it sees at that
+level, which is how you tell "the listener is not being called" apart from
+"the ring is asleep".
 
 ## Configuration
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
 | `ble_client_id` | id | the single `ble_client` | Which `ble_client` peer is the ring. Name it explicitly if the board has more than one. |
-| `min_sync_interval` | time period | `30min` | Floor between sync attempts. Stops a long continuous advertising period, such as a full charge cycle, from reconnecting over and over. Not a schedule — the advertisement edge is what decides *when*. |
+| `auto_sync` | boolean | `false` | Off: the component connects only when `start_sync()` is called. On: it also connects once when the ring appears after `off_air_threshold` continuously off air, retries once on failure, then stays silent until the ring has been off air that long again. The first sighting after boot counts as an appearance. Recommended: off. |
+| `off_air_threshold` | time period | `2h` | With `auto_sync`, how long the ring must be off air without a break before its next appearance triggers a sync. 1 min to 24 h. |
 | `battery_level` | sensor | — | Ring battery percentage, from the device's `CurBAT`. Diagnostic. |
 | `serial_number` | text sensor | — | The ring's serial, from `SN`. Also the directory name recordings are filed under. |
 | `state` | text sensor | — | The ring's raw `CurState`, published as reported rather than decoded. `0` and `2` are the values seen — awake, and post-session standby. |
@@ -150,6 +167,11 @@ not being called" apart from "the ring is asleep". A completed walk logs
 | `last_sync` | text sensor | — | The ring's own clock (`CurTIME`) from the last walk that finished with **no** failed transfer. See below. |
 
 All five entities are optional; configure only the ones you want.
+
+`start_sync()` is a method on the component, so give the component an `id`
+and call it from a lambda, as the button above does. It works whether or not
+`auto_sync` is on and never touches the automatic re-arm timer. It does
+nothing if a sync is already running or the BLE client is busy.
 
 `last_sync` is deliberately the ring's clock rather than the board's uptime,
 and it only advances on a clean walk. That distinction is what lets you tell
@@ -177,11 +199,18 @@ wakes up rather than re-downloading everything.
 
 ## Troubleshooting
 
-**Nothing happens at all.** The ring is almost certainly asleep. It is only
-on the air while worn or charging. Set `logger: level: VERBOSE` and watch for
+**Nothing happens at all.** With `auto_sync` off (the default) that is by
+design: nothing connects until `start_sync()` is called. Otherwise the ring is
+almost certainly asleep. It is only on the air while worn or charging. With
+`auto_sync` on, set `logger: level: VERBOSE` and watch for
 `advertisement seen` — that line is this component's own, because
 `esp32_ble_tracker` logs nothing per advertisement and its silence is
 indistinguishable from a listener that is never called.
+
+**`Auto sync skipped: not off air long enough since the last one`.** Expected
+with `auto_sync`: the ring already had its one automatic sync this
+appearance, or reappeared before `off_air_threshold` passed. Press the sync
+button to sync now.
 
 **Connects fail with `reason 0x100` then `status=133`.** Expected, and
 frequent — roughly half of attempts, after a 20-second timeout. The
@@ -189,10 +218,11 @@ connection is being cancelled locally rather than refused by the ring. The
 component retries up to 4 times, 3 seconds apart, which is comfortably inside
 the minutes-long window a charging ring stays awake.
 
-**`Edge ignored: client state N, not IDLE`.** Something else is holding the
-BLE client — most often `auto_connect: true` on the `ble_client`. The sync
-trigger is a one-shot edge, so while the client is stuck non-IDLE every later
-edge is swallowed until the ring next goes fully off the air.
+**`Sync requested but client state is N, not IDLE`** or **`Auto sync
+deferred: a connection is already in flight`.** Something else is holding the
+BLE client — most often `auto_connect: true` on the `ble_client`. The
+component only connects from IDLE, so while the client is stuck every sync
+request is refused.
 
 **The ring never appears while it is in the charger.** Check that it was
 actually discharged when docked. A full ring's window is a couple of minutes,
